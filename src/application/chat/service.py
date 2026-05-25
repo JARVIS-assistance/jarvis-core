@@ -15,13 +15,19 @@ from jarvis_contracts import ErrorResponse
 from starlette.websockets import WebSocket
 
 from ai import AIService
+
+# ── 베이스 시스템 프롬프트 ─────────────────────────────────
+# 페르소나보다 먼저 적용되는 JARVIS 핵심 정체성·규칙.
+# 모든 대화(realtime, deep)에서 항상 포함된다.
+# Workbench UI에서 수정 가능 (prompts.yaml → base_system 키).
+from core.config.prompt_loader import load_prompt as _load_prompt
 from core.db.db_connection import DBClient
 from core.db.db_operations import (
     add_message,
-    create_user_model_config,
-    delete_user_model_config,
     create_memory_item,
+    create_user_model_config,
     create_user_persona,
+    delete_user_model_config,
     ensure_default_persona_for_user,
     ensure_user_settings,
     get_active_model_for_user,
@@ -30,15 +36,14 @@ from core.db.db_operations import (
     get_or_create_session_for_user,
     get_selected_persona_for_user,
     get_user_ai_selection,
-    get_user_settings,
-    list_recent_messages,
     list_memory_items,
+    list_recent_messages,
+    list_user_model_configs,
     list_user_personas,
     select_user_persona,
-    list_user_model_configs,
     set_user_ai_selection,
-    update_user_persona,
     update_user_model_config,
+    update_user_persona,
 )
 from core.db.db_operations.model_config import get_active_realtime_model_for_user
 from router import choose_route
@@ -46,19 +51,12 @@ from safety import safety_gate
 
 from .schemas import (
     ChatOnceRequest,
-    ModelConfigUpsertRequest,
     MemoryCreateRequest,
+    ModelConfigUpsertRequest,
     ModelSelectionUpsertRequest,
     PersonaSelectionRequest,
     PersonaUpsertRequest,
 )
-
-
-# ── 베이스 시스템 프롬프트 ─────────────────────────────────
-# 페르소나보다 먼저 적용되는 JARVIS 핵심 정체성·규칙.
-# 모든 대화(realtime, deep)에서 항상 포함된다.
-# Workbench UI에서 수정 가능 (prompts.yaml → base_system 키).
-from core.config.prompt_loader import load_prompt as _load_prompt
 
 _BASE_SYSTEM_PROMPT_FALLBACK = """\
 You are JARVIS — an intelligent AI assistant system.
@@ -87,6 +85,15 @@ You are JARVIS — an intelligent AI assistant system.
 - If the message is an action request that the Controller should execute (for example opening a browser/app, searching, clicking, typing, running shell, checking the screen, or controlling the computer), respond exactly: "진행하겠습니다!"
 - Do not explain that you cannot operate the screen for action requests. The Controller action intent lane runs in parallel and will attempt the action.
 """
+
+_CONTEXT_EXCLUDE_MARKERS = (
+    "[provider-error]",
+    "provider-error",
+    "[현재 단계:",
+    "원래 요청:",
+    "이 단계의 목표:",
+    "client action result timed out",
+)
 
 
 def _get_base_system_prompt() -> str:
@@ -197,12 +204,34 @@ _REALTIME_COMPACT_SYSTEM_PROMPT = (
     "컴퓨터 조작 요청은 '진행하겠습니다!'만 출력."
 )
 
+_REALTIME_RESPONSE_GUARD = (
+    "실시간 규칙: 한국어 1-2문장, 80자 안팎. 긴 분석/계획/비교는 짧게 deep 전환만 말해."
+)
+
+_LENGTH_DONE_REASONS = {
+    "length",
+    "max_tokens",
+    "max_token",
+    "num_predict",
+    "limit",
+}
+
 
 def _get_realtime_system_prompt() -> str:
     loaded = _load_prompt("realtime_system")
-    if loaded and loaded.strip():
-        return loaded
-    return _REALTIME_COMPACT_SYSTEM_PROMPT
+    base = loaded if loaded and loaded.strip() else _REALTIME_COMPACT_SYSTEM_PROMPT
+    if _REALTIME_RESPONSE_GUARD in base:
+        return base
+    return f"{base.strip()}\n\n{_REALTIME_RESPONSE_GUARD}"
+
+
+def _is_length_done_reason(done_reason: str | None) -> bool:
+    if not done_reason:
+        return False
+    normalized = done_reason.strip().casefold()
+    return normalized in _LENGTH_DONE_REASONS or any(
+        marker in normalized for marker in _LENGTH_DONE_REASONS
+    )
 
 
 def _is_ollama_provider_name(provider_name: object) -> bool:
@@ -253,6 +282,13 @@ def _build_messages_for_model(
     route: str,
     selected_model: dict[str, object],
 ) -> tuple[str | None, list[dict[str, str]]]:
+    effective_user_message = user_message
+    if route == "deep" and _looks_like_action_routing_analysis(user_message):
+        effective_user_message = (
+            "분석/설계 요청입니다. 앱 실행, 브라우저 검색, 터미널 실행을 실제로 "
+            "수행하지 말고, 충돌하지 않는 라우팅 우선순위와 판단 기준을 답하세요.\n\n"
+            f"{user_message}"
+        )
     if _use_compact_realtime_messages(route, selected_model.get("provider_name")):
         realtime_prompt = (
             system_prompt
@@ -261,12 +297,15 @@ def _build_messages_for_model(
         )
         return realtime_prompt, [
             {"role": "system", "content": realtime_prompt},
-            {"role": "user", "content": _latest_user_message_content(user_message)},
+            {
+                "role": "user",
+                "content": _latest_user_message_content(effective_user_message),
+            },
         ]
     return system_prompt, _build_alternating_messages(
         system_prompt=system_prompt,
         context_messages=context_messages,
-        user_message=user_message,
+        user_message=effective_user_message,
     )
 
 
@@ -274,6 +313,51 @@ def _recent_context_limit(route: str) -> int:
     if route == "deep":
         return _int_env("JARVIS_DEEP_CONTEXT_RECENT_LIMIT", 12)
     return _int_env("JARVIS_REALTIME_CONTEXT_RECENT_LIMIT", 4)
+
+
+def _context_content_allowed(content: str) -> bool:
+    folded = content.casefold()
+    return not any(marker.casefold() in folded for marker in _CONTEXT_EXCLUDE_MARKERS)
+
+
+def _filter_context_messages(
+    messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    return [
+        message
+        for message in messages
+        if _context_content_allowed(str(message.get("content", "")))
+    ]
+
+
+def _looks_like_action_routing_analysis(message: str) -> bool:
+    folded = message.casefold()
+    design_terms = (
+        "설계",
+        "분석",
+        "우선순위",
+        "충돌",
+        "비교",
+        "라우팅",
+        "design",
+        "analyze",
+        "priority",
+        "conflict",
+        "routing",
+    )
+    action_terms = (
+        "액션",
+        "앱 실행",
+        "브라우저 검색",
+        "터미널 실행",
+        "action",
+        "app",
+        "browser",
+        "terminal",
+    )
+    return any(term in folded for term in design_terms) and any(
+        term in folded for term in action_terms
+    )
 
 
 def _int_env(name: str, default: int) -> int:
@@ -500,7 +584,7 @@ class ChatService:
         return choose_route(message, task_type)
 
     def _build_prompt_context(
-        self, *, user_id: str, chat_id: str, route: str
+        self, *, user_id: str, chat_id: str, route: str, current_message: str = ""
     ) -> tuple[str | None, list[dict[str, str]]]:
         settings = ensure_user_settings(self.db, user_id=user_id)
         persona = None
@@ -521,7 +605,10 @@ class ChatService:
         custom_instructions = metadata.get("custom_instructions") if isinstance(metadata, dict) else None
         memory_lines = [f"- ({item['type']}/{item['importance']}) {item['content']}" for item in memories]
         route_line = (
-            "Use deeper analysis, surface assumptions, and be explicit about tradeoffs."
+            "Use deeper analysis, surface assumptions, and be explicit about tradeoffs. "
+            "If the latest message asks to design, analyze, compare, or prioritize "
+            "action routing or capabilities, treat it as an analysis request, not an "
+            "execution request; do not say '진행하겠습니다!' and do not claim actions ran."
             if route == "deep"
             else "Respond with low latency and concise, directly useful guidance."
         )
@@ -543,11 +630,23 @@ class ChatService:
             system_parts.append(f"Custom user instructions: {custom_instructions}")
         if memory_lines:
             system_parts.append("Relevant memory:\n" + "\n".join(memory_lines))
-        if summary is not None and summary.get("summary_text"):
+        if route == "deep" and _looks_like_action_routing_analysis(current_message):
+            system_parts.append(
+                "HIGH PRIORITY: The latest user message is asking for a design or "
+                "analysis of action routing/capability priority. It is not asking "
+                "you to run an app, browser search, or terminal command. Answer with "
+                "the requested routing design. Do not say '진행하겠습니다!' and do "
+                "not claim any action was performed."
+            )
+        if (
+            summary is not None
+            and summary.get("summary_text")
+            and _context_content_allowed(str(summary["summary_text"]))
+        ):
             system_parts.append(summary["summary_text"])
         system_prompt = "\n\n".join(system_parts)
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(recent_messages)
+        messages.extend(_filter_context_messages(recent_messages))
         return system_prompt, messages
 
     async def request_once(
@@ -581,7 +680,10 @@ class ChatService:
         )
         if compact_context is None:
             system_prompt, prompt_messages = self._build_prompt_context(
-                user_id=user_id, chat_id=session_id, route=route
+                user_id=user_id,
+                chat_id=session_id,
+                route=route,
+                current_message=body.message,
             )
         else:
             system_prompt, prompt_messages = compact_context
@@ -685,10 +787,16 @@ class ChatService:
     ) -> None:
         """Stream tokens from the AI service to the WebSocket client."""
         chunks: list[str] = []
+        done_reason = "stop"
         try:
-            async for token in self.ai_service.realtime_session_send(
-                request_payload, rt_session_id
-            ):
+            async for event in self.ai_service.stream_token_events(request_payload):
+                event_type = event.get("type")
+                if event_type == "done":
+                    done_reason = str(event.get("done_reason") or done_reason)
+                    continue
+                token = str(event.get("content") or "")
+                if not token:
+                    continue
                 chunks.append(token)
                 await websocket.send_json(
                     {
@@ -712,6 +820,7 @@ class ChatService:
         full = "".join(chunks).strip()
         if full:
             add_message(self.db, chat_session_id, "assistant", full)
+        truncated = _is_length_done_reason(done_reason)
         _log_model_response(
             request_id=request_id,
             user_id=str(request_payload.get("user_id", "")),
@@ -722,7 +831,24 @@ class ChatService:
             stream="websocket",
             output_chars=len(full),
         )
-        await websocket.send_json({"type": "assistant_done", "request_id": request_id})
+        if truncated:
+            await websocket.send_json(
+                {
+                    "type": "assistant_truncated",
+                    "request_id": request_id,
+                    "done_reason": done_reason,
+                    "content": "realtime response hit provider length limit",
+                }
+            )
+        await websocket.send_json(
+            {
+                "type": "assistant_done",
+                "request_id": request_id,
+                "content": full,
+                "done_reason": done_reason,
+                "truncated": truncated,
+            }
+        )
 
     # ── run_realtime ────────────────────────────────────────────
 
@@ -829,7 +955,10 @@ class ChatService:
                 )
                 if compact_context is None:
                     system_prompt, prompt_messages = self._build_prompt_context(
-                        user_id=user_id, chat_id=chat_session_id, route=route
+                        user_id=user_id,
+                        chat_id=chat_session_id,
+                        route=route,
+                        current_message=content,
                     )
                 else:
                     system_prompt, prompt_messages = compact_context
@@ -946,7 +1075,10 @@ class ChatService:
             )
             if compact_context is None:
                 system_prompt, prompt_messages = self._build_prompt_context(
-                    user_id=user_id, chat_id=session_id, route=route
+                    user_id=user_id,
+                    chat_id=session_id,
+                    route=route,
+                    current_message=message,
                 )
             else:
                 system_prompt, prompt_messages = compact_context
@@ -1005,8 +1137,16 @@ class ChatService:
 
         # stream tokens
         chunks: list[str] = []
+        done_reason = "stop"
         try:
-            async for token in self.ai_service.stream_tokens(request_payload):
+            async for event in self.ai_service.stream_token_events(request_payload):
+                event_type = event.get("type")
+                if event_type == "done":
+                    done_reason = str(event.get("done_reason") or done_reason)
+                    continue
+                token = str(event.get("content") or "")
+                if not token:
+                    continue
                 chunks.append(token)
                 yield f"event: assistant_delta\ndata: {json.dumps({'request_id': request_id, 'content': token})}\n\n"
         except Exception as exc:
@@ -1016,6 +1156,7 @@ class ChatService:
         full = "".join(chunks).strip()
         if full:
             add_message(self.db, session_id, "assistant", full)
+        truncated = _is_length_done_reason(done_reason)
         _log_model_response(
             request_id=request_id,
             user_id=user_id,
@@ -1026,8 +1167,16 @@ class ChatService:
             stream="sse",
             output_chars=len(full),
         )
+        if truncated:
+            yield (
+                "event: assistant_truncated\n"
+                f"data: {json.dumps({'request_id': request_id, 'done_reason': done_reason, 'content': 'realtime response hit provider length limit'})}\n\n"
+            )
 
-        yield f"event: assistant_done\ndata: {json.dumps({'request_id': request_id, 'content': full})}\n\n"
+        yield (
+            "event: assistant_done\n"
+            f"data: {json.dumps({'request_id': request_id, 'content': full, 'done_reason': done_reason, 'truncated': truncated})}\n\n"
+        )
 
     async def close_realtime_session(
         self, request: dict[str, object], realtime_session_id: str
@@ -1136,17 +1285,30 @@ class ChatService:
     def set_model_selection(
         self, user_id: str, body: ModelSelectionUpsertRequest
     ) -> dict[str, str | None]:
-        if body.realtime_model_config_id is not None:
+        existing = get_user_ai_selection(self.db, user_id=user_id) or {}
+        fields_set = getattr(body, "model_fields_set", set())
+        realtime_model_config_id = (
+            body.realtime_model_config_id
+            if "realtime_model_config_id" in fields_set
+            else existing.get("realtime_model_config_id")
+        )
+        deep_model_config_id = (
+            body.deep_model_config_id
+            if "deep_model_config_id" in fields_set
+            else existing.get("deep_model_config_id")
+        )
+
+        if realtime_model_config_id is not None:
             realtime = get_model_config_by_id_for_user(
-                self.db, user_id=user_id, model_config_id=body.realtime_model_config_id
+                self.db, user_id=user_id, model_config_id=realtime_model_config_id
             )
             if realtime is None or not bool(realtime.get("supports_realtime", False)):
                 raise HTTPException(
                     status_code=400, detail="invalid realtime_model_config_id"
                 )
-        if body.deep_model_config_id is not None:
+        if deep_model_config_id is not None:
             deep = get_model_config_by_id_for_user(
-                self.db, user_id=user_id, model_config_id=body.deep_model_config_id
+                self.db, user_id=user_id, model_config_id=deep_model_config_id
             )
             if deep is None:
                 raise HTTPException(
@@ -1156,8 +1318,8 @@ class ChatService:
         result = set_user_ai_selection(
             self.db,
             user_id=user_id,
-            realtime_model_config_id=body.realtime_model_config_id,
-            deep_model_config_id=body.deep_model_config_id,
+            realtime_model_config_id=realtime_model_config_id,
+            deep_model_config_id=deep_model_config_id,
         )
         self._invalidate_realtime_cache(user_id)
         return result

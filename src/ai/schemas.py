@@ -15,6 +15,12 @@ class AIStreamChunk(TypedDict, total=False):
     content: str
 
 
+class AITokenStreamEvent(TypedDict, total=False):
+    type: Literal["token", "done"]
+    content: str
+    done_reason: str
+
+
 class AIRequest(TypedDict):
     message: str
     route: str

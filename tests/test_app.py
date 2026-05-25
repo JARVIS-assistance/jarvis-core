@@ -1,16 +1,18 @@
 import json
 import logging
 from tempfile import NamedTemporaryFile
-from textwrap import dedent
 
 from fastapi.testclient import TestClient
 from jarvis_contracts import JarvisCoreEndpoints
 
 from ai import AIService
 from app import create_app
+from application.audio.schemas import TextToSpeechPCMRequest
+from application.audio.service import TextToSpeechResult, TextToSpeechService
 from application.chat.service import _build_alternating_messages, _build_messages_for_model
 from core.config.prompt_loader import load_prompt
 from core.db.db_connection import connect
+from core.db.db_operations import add_message, get_or_create_session_for_user
 
 
 class RecordingAIClient:
@@ -43,6 +45,11 @@ class RecordingAIClient:
         self.requests.append(request)
         yield "ok"
 
+    async def stream_token_events(self, request: dict[str, object]):
+        async for token in self.stream_tokens(request):
+            yield {"type": "token", "content": token}
+        yield {"type": "done", "done_reason": "stop"}
+
     async def realtime_session_start(self, request: dict[str, object]) -> str:
         return "rt-test"
 
@@ -58,6 +65,112 @@ class RecordingAIClient:
 
     async def cancel_generation(self, realtime_session_id: str) -> None:
         return None
+
+
+class LengthLimitedAIClient(RecordingAIClient):
+    async def stream_token_events(self, request: dict[str, object]):
+        self.requests.append(request)
+        yield {"type": "token", "content": "짧게 "}
+        yield {"type": "token", "content": "답변"}
+        yield {"type": "done", "done_reason": "length"}
+
+
+class RecordingTextToSpeechService:
+    def __init__(self) -> None:
+        self.requests: list[object] = []
+        self.pcm_requests: list[object] = []
+
+    async def synthesize(self, request: object) -> TextToSpeechResult:
+        self.requests.append(request)
+        return TextToSpeechResult(
+            audio=b"audio-bytes",
+            media_type="audio/mpeg",
+            provider="openai",
+            model="gpt-4o-mini-tts",
+            voice="marin",
+            response_format="mp3",
+        )
+
+    def ensure_server_pcm_available(self) -> None:
+        return None
+
+    def server_pcm_headers(self, request: object) -> dict[str, str]:
+        return {
+            "X-TTS-Provider": "server",
+            "X-TTS-Voice": getattr(request, "voice", "default"),
+            "X-TTS-Format": getattr(request, "format", "pcm_s16le"),
+            "X-TTS-Sample-Rate": str(getattr(request, "sample_rate", 24000)),
+            "X-TTS-Channels": str(getattr(request, "channels", 1)),
+            "X-TTS-Sample-Width": str(getattr(request, "sample_width", 2)),
+            "X-TTS-Chunk-Count": str(len(getattr(request, "chunks", []))),
+            "X-AI-Generated-Voice": "true",
+        }
+
+    async def stream_server_pcm(self, request: object):
+        self.pcm_requests.append(request)
+        yield b"pcm-1"
+        yield b"pcm-2"
+
+
+class RecordingLocalTTSEngine:
+    def __init__(
+        self,
+        *,
+        model_name: str = "test-local-tts",
+        supports_model_selection: bool = False,
+    ) -> None:
+        self._model_name = model_name
+        self._supports_model_selection = supports_model_selection
+        self.wav_requests: list[dict[str, object]] = []
+        self.pcm_requests: list[dict[str, object]] = []
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def supports_model_selection(self) -> bool:
+        return self._supports_model_selection
+
+    def runtime_label(self) -> str:
+        return self._model_name
+
+    def is_available(self) -> bool:
+        return True
+
+    async def synthesize_wav(
+        self,
+        *,
+        text: str,
+        voice: str,
+        sample_rate: int,
+        model: str | None = None,
+    ) -> bytes:
+        self.wav_requests.append(
+            {"text": text, "voice": voice, "sample_rate": sample_rate, "model": model}
+        )
+        return b"local-wav"
+
+    async def synthesize_pcm(
+        self,
+        *,
+        text: str,
+        voice: str,
+        sample_rate: int,
+        channels: int,
+        sample_width: int,
+        model: str | None = None,
+    ) -> bytes:
+        self.pcm_requests.append(
+            {
+                "text": text,
+                "voice": voice,
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "sample_width": sample_width,
+                "model": model,
+            }
+        )
+        return b"local-pcm"
 
 
 def test_health() -> None:
@@ -111,6 +224,265 @@ def test_internal_chat_request_accepts_deep_override() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["route"] == "deep"
+
+
+def test_internal_audio_speech_returns_generated_audio() -> None:
+    tts_service = RecordingTextToSpeechService()
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH.path,
+        json={
+            "text": "안녕하세요",
+            "voice": "marin",
+            "response_format": "mp3",
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"audio-bytes"
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.headers["x-tts-provider"] == "openai"
+    assert response.headers["x-tts-model"] == "gpt-4o-mini-tts"
+    assert response.headers["x-ai-generated-voice"] == "true"
+    assert tts_service.requests
+
+
+def test_internal_audio_speech_uses_local_tts_without_cloud_key(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    local_engine = RecordingLocalTTSEngine()
+    tts_service = TextToSpeechService(local_engine=local_engine)
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH.path,
+        json={
+            "text": "안녕하세요",
+            "voice": "marin",
+            "response_format": "mp3",
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-local"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"local-wav"
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.headers["x-tts-provider"] == "local"
+    assert response.headers["x-tts-model"] == "test-local-tts"
+    assert response.headers["x-tts-voice"] == "default"
+    assert response.headers["x-tts-format"] == "wav"
+    assert local_engine.wav_requests == [
+        {
+            "text": "안녕하세요",
+            "voice": "marin",
+            "sample_rate": 24000,
+            "model": "test-local-tts",
+        }
+    ]
+
+
+def test_internal_audio_speech_pcm_streams_generated_chunks() -> None:
+    tts_service = RecordingTextToSpeechService()
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path,
+        json={
+            "chunks": [
+                {"id": "c1", "text": "안녕"},
+                {"id": "c2", "text": "하세요"},
+            ],
+            "voice": "main",
+            "sample_rate": 24000,
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-pcm"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"pcm-1pcm-2"
+    assert response.headers["content-type"] == "audio/pcm"
+    assert response.headers["x-tts-provider"] == "server"
+    assert response.headers["x-tts-format"] == "pcm_s16le"
+    assert response.headers["x-tts-sample-rate"] == "24000"
+    assert response.headers["x-tts-chunk-count"] == "2"
+    assert tts_service.pcm_requests
+
+
+def test_internal_audio_speech_pcm_accepts_frontend_default_aliases() -> None:
+    tts_service = RecordingTextToSpeechService()
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path,
+        json={
+            "chunks": [{"id": "c-1770000000000", "text": "안녕하세요."}],
+            "voice": "marin",
+            "model": "gpt-4o-mini-tts",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-pcm"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"pcm-1pcm-2"
+    request = tts_service.pcm_requests[-1]
+    assert getattr(request, "voice") == "default"
+    assert getattr(request, "model") is None
+
+
+def test_internal_audio_speech_pcm_uses_default_qwen_tts_for_frontend_model_alias(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_TTS_SERVER_URL", "http://tts-runtime.local")
+    monkeypatch.delenv("JARVIS_TTS_SERVER_PCM_ENDPOINT", raising=False)
+    monkeypatch.delenv("JARVIS_LOCAL_TTS_MODEL", raising=False)
+    body = TextToSpeechPCMRequest(
+        chunks=[{"id": "c-1770000000000", "text": "안녕하세요."}],
+        voice="default",
+        model="gpt-4o-mini-tts",
+        sample_rate=24000,
+        channels=1,
+        sample_width=2,
+        format="pcm_s16le",
+    )
+
+    headers = TextToSpeechService().server_pcm_headers(body)
+
+    assert body.model is None
+    assert headers["X-TTS-Model"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+
+def test_internal_audio_speech_pcm_preserves_user_selected_model(monkeypatch) -> None:
+    monkeypatch.delenv("JARVIS_TTS_SERVER_URL", raising=False)
+    monkeypatch.delenv("JARVIS_TTS_SERVER_PCM_ENDPOINT", raising=False)
+    local_engine = RecordingLocalTTSEngine(supports_model_selection=True)
+    tts_service = TextToSpeechService(local_engine=local_engine)
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path,
+        json={
+            "chunks": [{"id": "c-1770000000000", "text": "안녕하세요."}],
+            "voice": "default",
+            "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-selected-model"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-tts-model"] == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    assert local_engine.pcm_requests[-1]["model"] == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+
+def test_internal_audio_speech_models_returns_selectable_qwen_tts_models(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_TTS_SERVER_URL", "http://tts-runtime.local")
+    client = TestClient(create_app())
+    response = client.get(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_MODELS.path,
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-models"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    model_ids = [item["id"] for item in payload["models"]]
+    assert model_ids[0] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    assert "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" in model_ids
+
+
+def test_internal_audio_speech_models_returns_local_only_without_selectable_runtime(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("JARVIS_TTS_SERVER_URL", raising=False)
+    monkeypatch.delenv("JARVIS_TTS_SERVER_PCM_ENDPOINT", raising=False)
+    local_engine = RecordingLocalTTSEngine(model_name="local/test-tts")
+    tts_service = TextToSpeechService(local_engine=local_engine)
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.get(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_MODELS.path,
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-models-local"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["models"] == [
+        {
+            "id": "local/test-tts",
+            "label": "local/test-tts",
+            "provider": "local",
+            "is_default": True,
+        }
+    ]
+
+
+def test_internal_audio_speech_pcm_rejects_qwen_model_without_selectable_runtime(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("JARVIS_TTS_SERVER_URL", raising=False)
+    monkeypatch.delenv("JARVIS_TTS_SERVER_PCM_ENDPOINT", raising=False)
+    local_engine = RecordingLocalTTSEngine(model_name="local/test-tts")
+    tts_service = TextToSpeechService(local_engine=local_engine)
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path,
+        json={
+            "chunks": [{"id": "c-1770000000000", "text": "안녕하세요."}],
+            "voice": "default",
+            "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-no-runtime"},
+    )
+
+    assert response.status_code == 503
+    assert "requires a model-selectable TTS runtime" in response.json()["detail"]
+    assert local_engine.pcm_requests == []
+
+
+def test_internal_audio_speech_pcm_falls_back_to_local_tts(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("JARVIS_TTS_SERVER_URL", raising=False)
+    monkeypatch.delenv("JARVIS_TTS_SERVER_PCM_ENDPOINT", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    local_engine = RecordingLocalTTSEngine()
+    tts_service = TextToSpeechService(local_engine=local_engine)
+    client = TestClient(create_app(tts_service=tts_service))
+    response = client.post(
+        JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path,
+        json={
+            "chunks": [{"id": "c-1770000000000", "text": "안녕하세요."}],
+            "voice": "default",
+            "model": "gpt-4o-mini-tts",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        headers={"x-user-id": "u1", "x-request-id": "r-tts-pcm"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"local-pcm"
+    assert response.headers["content-type"] == "audio/pcm"
+    assert response.headers["x-tts-provider"] == "local"
+    assert response.headers["x-tts-model"] == "test-local-tts"
+    assert local_engine.pcm_requests == [
+        {
+            "text": "안녕하세요.",
+            "voice": "default",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "model": "test-local-tts",
+        }
+    ]
 
 
 def test_default_prompt_loader_reads_workbench_prompt() -> None:
@@ -184,6 +556,80 @@ def test_runtime_profile_preserves_terminal_policy_metadata() -> None:
             ]
 
 
+def test_internal_todo_crud_keeps_calendar_fields_as_references() -> None:
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name))
+        headers = {"x-user-id": "u-todo", "x-user-email": "todo@example.com"}
+        with TestClient(app) as client:
+            created_response = client.post(
+                JarvisCoreEndpoints.INTERNAL_TODOS.path,
+                json={
+                    "title": "캘린더 연동 준비",
+                    "description": "나중에 일정과 연결할 할 일",
+                    "priority": 2,
+                    "due_at": "2026-05-20T09:00:00+09:00",
+                    "timezone": "Asia/Seoul",
+                    "calendar_provider": "apple",
+                    "calendar_id": "work",
+                    "calendar_event_id": "evt-1",
+                    "metadata": {"source": "test"},
+                },
+                headers=headers,
+            )
+
+            assert created_response.status_code == 200
+            created = created_response.json()
+            assert created["status"] == "open"
+            assert created["calendar_sync_status"] == "linked"
+            assert created["calendar_event_id"] == "evt-1"
+            assert created["metadata"] == {"source": "test"}
+
+            invalid_response = client.post(
+                JarvisCoreEndpoints.INTERNAL_TODOS.path,
+                json={"title": "시간 형식 오류", "due_at": "not-a-date"},
+                headers=headers,
+            )
+            assert invalid_response.status_code == 422
+
+            list_response = client.get(
+                JarvisCoreEndpoints.INTERNAL_TODOS_LIST.path,
+                headers=headers,
+            )
+            assert list_response.status_code == 200
+            assert [item["id"] for item in list_response.json()["items"]] == [
+                created["id"]
+            ]
+
+            update_response = client.patch(
+                JarvisCoreEndpoints.INTERNAL_TODO_UPDATE.path.format(
+                    todo_id=created["id"]
+                ),
+                json={"status": "completed"},
+                headers=headers,
+            )
+            assert update_response.status_code == 200
+            updated = update_response.json()
+            assert updated["status"] == "completed"
+            assert updated["completed_at"] is not None
+            assert updated["calendar_event_id"] == "evt-1"
+
+            delete_response = client.delete(
+                JarvisCoreEndpoints.INTERNAL_TODO_DELETE.path.format(
+                    todo_id=created["id"]
+                ),
+                headers=headers,
+            )
+            assert delete_response.status_code == 200
+            assert delete_response.json() == {"id": created["id"], "deleted": True}
+
+            empty_response = client.get(
+                JarvisCoreEndpoints.INTERNAL_TODOS_LIST.path,
+                headers=headers,
+            )
+            assert empty_response.status_code == 200
+            assert empty_response.json()["items"] == []
+
+
 def test_realtime_request_uses_workbench_base_prompt(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_OLLAMA_REALTIME_COMPACT_PROMPT", "0")
     ai_client = RecordingAIClient()
@@ -244,25 +690,13 @@ def test_ollama_realtime_stream_uses_workbench_realtime_prompt(monkeypatch) -> N
     assert response.status_code == 200
     assert "assistant_delta" in body
     system_prompt = str(ai_client.requests[-1]["system_prompt"])
-    assert system_prompt == "Workbench realtime prompt. 짧게 답해."
+    assert system_prompt.startswith("Workbench realtime prompt. 짧게 답해.")
+    assert "실시간 규칙" in system_prompt
     assert "Current-turn priority" not in system_prompt
 
 
 def test_ollama_realtime_prompt_reflects_yaml_updates(monkeypatch, tmp_path) -> None:
     prompts_path = tmp_path / "prompts.yaml"
-    prompts_path.write_text(
-        dedent(
-            """
-            version: 1
-            prompts:
-              realtime_system:
-                name: Realtime
-                description: test
-                content: 첫 번째 realtime prompt
-            """
-        ),
-        encoding="utf-8",
-    )
     monkeypatch.setenv("JARVIS_PROMPTS_YAML", str(prompts_path))
     ai_client = RecordingAIClient()
     ai_service = AIService(
@@ -276,15 +710,18 @@ def test_ollama_realtime_prompt_reflects_yaml_updates(monkeypatch, tmp_path) -> 
         with TestClient(app) as client:
             for content in ("첫 번째 realtime prompt", "두 번째 realtime prompt"):
                 prompts_path.write_text(
-                    dedent(
-                        f"""
-                        version: 1
-                        prompts:
-                          realtime_system:
-                            name: Realtime
-                            description: test
-                            content: {content}
-                        """
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "prompts": {
+                                "realtime_system": {
+                                    "name": "Realtime",
+                                    "description": "test",
+                                    "content": content,
+                                }
+                            },
+                        },
+                        ensure_ascii=False,
                     ),
                     encoding="utf-8",
                 )
@@ -301,7 +738,9 @@ def test_ollama_realtime_prompt_reflects_yaml_updates(monkeypatch, tmp_path) -> 
                     body = "".join(response.iter_text())
                 assert response.status_code == 200
                 assert "assistant_delta" in body
-                assert ai_client.requests[-1]["system_prompt"] == content
+                system_prompt = str(ai_client.requests[-1]["system_prompt"])
+                assert system_prompt.startswith(content)
+                assert "실시간 규칙" in system_prompt
 
 
 def test_ollama_realtime_prompt_preserves_long_yaml_content(monkeypatch, tmp_path) -> None:
@@ -348,7 +787,38 @@ def test_ollama_realtime_prompt_preserves_long_yaml_content(monkeypatch, tmp_pat
 
     assert response.status_code == 200
     assert "assistant_delta" in body
-    assert ai_client.requests[-1]["system_prompt"] == long_prompt
+    system_prompt = str(ai_client.requests[-1]["system_prompt"])
+    assert system_prompt.startswith(long_prompt.strip())
+    assert "실시간 규칙" in system_prompt
+
+
+def test_realtime_stream_marks_length_limited_response() -> None:
+    ai_client = LengthLimitedAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            with client.stream(
+                "POST",
+                "/internal/chat/stream",
+                json={"message": "자세히 설명해줘", "route_override": "realtime"},
+                headers={
+                    "x-user-id": "u-length-limit",
+                    "x-user-email": "u-length-limit@example.com",
+                    "x-request-id": "r-length-limit",
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "assistant_truncated" in body
+    assert '"done_reason": "length"' in body
+    assert '"truncated": true' in body
 
 
 def test_realtime_stream_marks_latest_user_message_as_current_turn() -> None:
@@ -423,7 +893,13 @@ def test_ollama_realtime_uses_compact_current_turn_messages() -> None:
     assert "JARVIS" in system_prompt
     assert messages == [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "안녕?"},
+        {
+            "role": "user",
+            "content": (
+                "Latest user message. Respond to this message, not to the previous "
+                "topic, unless this message explicitly refers back to it:\n안녕?"
+            ),
+        },
     ]
 
 
@@ -728,6 +1204,75 @@ def test_default_model_update_preserves_realtime_selection() -> None:
     assert current_selection.json()["deep_model_config_id"] == default_id
 
 
+def test_model_selection_partial_update_preserves_other_slot() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            realtime_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "realtime-model",
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-partial-selection"},
+            )
+            deep_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "deep-model",
+                    "supports_stream": True,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-partial-selection"},
+            )
+            other_realtime_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "other-realtime-model",
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-partial-selection"},
+            )
+            realtime_id = realtime_response.json()["id"]
+            deep_id = deep_response.json()["id"]
+            other_realtime_id = other_realtime_response.json()["id"]
+
+            selection_response = client.post(
+                "/internal/chat/model-selection",
+                json={
+                    "realtime_model_config_id": realtime_id,
+                    "deep_model_config_id": deep_id,
+                },
+                headers={"x-user-id": "u-partial-selection"},
+            )
+            assert selection_response.status_code == 200
+
+            partial_response = client.post(
+                "/internal/chat/model-selection",
+                json={"realtime_model_config_id": other_realtime_id},
+                headers={"x-user-id": "u-partial-selection"},
+            )
+
+    assert partial_response.status_code == 200
+    assert partial_response.json()["realtime_model_config_id"] == other_realtime_id
+    assert partial_response.json()["deep_model_config_id"] == deep_id
+
+
 def test_realtime_selection_rejects_non_realtime_model() -> None:
     ai_client = RecordingAIClient()
     ai_service = AIService(
@@ -939,6 +1484,148 @@ def test_deepthink_uses_memory_and_saves_user_message() -> None:
                 ("user", "내 선호 기억하고 있어?"),
             )
             assert cursor.fetchone() is not None
+
+
+def test_deepthink_prefers_selected_deep_model_over_default() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            default_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "default-model",
+                    "is_default": True,
+                    "supports_stream": True,
+                    "supports_realtime": True,
+                },
+                headers={"x-user-id": "u-deep-selection"},
+            )
+            assert default_response.status_code == 200
+
+            deep_response = client.post(
+                "/internal/chat/model-config",
+                json={
+                    "provider_mode": "local",
+                    "provider_name": "ollama",
+                    "model_name": "selected-deep-model",
+                    "is_default": False,
+                    "supports_stream": True,
+                    "supports_realtime": False,
+                },
+                headers={"x-user-id": "u-deep-selection"},
+            )
+            assert deep_response.status_code == 200
+            deep_id = deep_response.json()["id"]
+
+            selection_response = client.post(
+                "/internal/chat/model-selection",
+                json={"deep_model_config_id": deep_id},
+                headers={"x-user-id": "u-deep-selection"},
+            )
+            assert selection_response.status_code == 200
+
+            plan_response = client.post(
+                JarvisCoreEndpoints.INTERNAL_DEEPTHINK_PLAN.path,
+                json={"request_id": "r-deep-model", "message": "깊게 분석해줘"},
+                headers={"x-user-id": "u-deep-selection"},
+            )
+
+    assert plan_response.status_code == 200
+    assert ai_client.requests
+    assert ai_client.requests[-1]["model_name"] == "selected-deep-model"
+
+
+def test_deepthink_without_user_model_uses_env_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_FALLBACK_PROVIDER_NAME", "ollama")
+    monkeypatch.setenv("JARVIS_FALLBACK_MODEL_NAME", "gemma4:e4b")
+    monkeypatch.setenv(
+        "JARVIS_FALLBACK_MODEL_ENDPOINT",
+        "http://host.docker.internal:3030/chat",
+    )
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        app = create_app(db=connect(db_file.name), ai_service=ai_service)
+        with TestClient(app) as client:
+            response = client.post(
+                JarvisCoreEndpoints.INTERNAL_DEEPTHINK_PLAN.path,
+                json={"request_id": "r-fallback", "message": "라우팅 설계해줘"},
+                headers={"x-user-id": "u-no-model"},
+            )
+
+    assert response.status_code == 200
+    assert ai_client.requests
+    request = ai_client.requests[0]
+    assert request["provider_name"] == "ollama"
+    assert request["model_name"] == "gemma4:e4b"
+    assert request["endpoint"] == "http://host.docker.internal:3030/chat"
+
+
+def test_deep_chat_context_filters_provider_errors_and_internal_steps() -> None:
+    ai_client = RecordingAIClient()
+    ai_service = AIService(
+        default_client=ai_client,
+        local_client=ai_client,
+        token_client=ai_client,
+    )
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        db = connect(db_file.name)
+        app = create_app(db=db, ai_service=ai_service)
+        with TestClient(app) as client:
+            session = get_or_create_session_for_user(
+                db,
+                user_id="u-filter",
+                email="filter@example.com",
+            )
+            add_message(
+                db, session["id"], "assistant", "[provider-error] localhost:8080"
+            )
+            add_message(
+                db,
+                session["id"],
+                "user",
+                "[현재 단계: bad]\n원래 요청: 앱 실행\n이 단계의 목표: execute",
+            )
+            add_message(db, session["id"], "assistant", "정상 이전 응답")
+            response = client.post(
+                "/internal/chat/request",
+                json={
+                    "message": (
+                        "앱 실행, 브라우저 검색, 터미널 실행 액션 라우팅 "
+                        "우선순위를 설계해줘"
+                    ),
+                    "route_override": "deep",
+                },
+                headers={"x-user-id": "u-filter", "x-user-email": "filter@example.com"},
+            )
+
+    assert response.status_code == 200
+    assert ai_client.requests
+    request = ai_client.requests[-1]
+    messages_text = "\n".join(
+        str(message.get("content", "")) for message in request["messages"]
+    )
+    assert "provider-error" not in messages_text
+    assert "[현재 단계:" not in messages_text
+    assert "원래 요청:" not in messages_text
+    assert "HIGH PRIORITY" in messages_text
+    assert "not asking you to run an app" in messages_text
+    assert "분석/설계 요청입니다" in messages_text
 
 
 def test_deepthink_scroll_fallback_creates_browser_action() -> None:

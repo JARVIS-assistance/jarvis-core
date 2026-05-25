@@ -4,7 +4,7 @@ import inspect
 from collections.abc import AsyncGenerator
 
 from .client import AIClient, LocalLLMAIClient, TokenAIClient
-from .schemas import AIRequest, AIResponse, AIStreamChunk
+from .schemas import AIRequest, AIResponse, AIStreamChunk, AITokenStreamEvent
 
 
 class AIService:
@@ -41,6 +41,19 @@ class AIService:
         client = self._choose_client(request["provider_mode"])
         async for token in client.stream_tokens(request):
             yield token
+
+    async def stream_token_events(
+        self, request: AIRequest
+    ) -> AsyncGenerator[AITokenStreamEvent, None]:
+        client = self._choose_client(request["provider_mode"])
+        stream_events = getattr(client, "stream_token_events", None)
+        if callable(stream_events):
+            async for event in stream_events(request):
+                yield event
+            return
+        async for token in client.stream_tokens(request):
+            yield {"type": "token", "content": token}
+        yield {"type": "done", "done_reason": "stop"}
 
     async def realtime_session_start(self, request: AIRequest) -> str:
         client = self._choose_client(request["provider_mode"])

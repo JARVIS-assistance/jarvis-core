@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Header
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response, StreamingResponse
 from jarvis_contracts import (
     ClientAction,
     DeepThinkPlanRequest,
@@ -15,10 +15,16 @@ from jarvis_contracts import (
     InternalConversationRequest,
     InternalConversationResponse,
     JarvisCoreEndpoints,
+    TodoCreateRequest,
+    TodoListResponse,
+    TodoResponse,
+    TodoUpdateRequest,
 )
 
 from ai import AIService
 from ai.client import StubAIClient
+from application.audio.schemas import TextToSpeechPCMRequest, TextToSpeechRequest
+from application.audio.service import TextToSpeechError, TextToSpeechService
 from application.chat.schemas import (
     ChatOnceRequest,
     ChatOnceResponse,
@@ -42,7 +48,16 @@ from application.deepthink.schemas import (
     DeepThinkStepInput,
 )
 from core.db.db_connection import DBClient, connect
-from core.db.db_operations import get_runtime_profile, set_runtime_profile
+from core.db.db_operations import (
+    create_todo_item,
+    delete_todo_item,
+    ensure_user_exists,
+    get_runtime_profile,
+    get_todo_item,
+    list_todo_items,
+    set_runtime_profile,
+    update_todo_item,
+)
 from core.db.db_schema import init_db
 from jarvis_core import available_modes, run_deep_thinking, run_realtime_conversation
 from middleware import RequestIDMiddleware
@@ -68,9 +83,26 @@ def _get_deepthink_service(app: FastAPI) -> DeepThinkService:
     return DeepThinkService(db=app.state.db, ai_service=app.state.ai_service)
 
 
-def create_app(db: DBClient | None = None, ai_service: AIService | None = None) -> FastAPI:
+def _get_tts_service(app: FastAPI):
+    service = getattr(app.state, "tts_service", None)
+    if service is not None:
+        return service
+    service = TextToSpeechService()
+    app.state.tts_service = service
+    return service
+
+
+def create_app(
+    db: DBClient | None = None,
+    ai_service: AIService | None = None,
+    tts_service: TextToSpeechService | None = None,
+) -> FastAPI:
     app = FastAPI(title="jarvis-core", version="0.3.0")
     app.add_middleware(RequestIDMiddleware)
+    if ai_service is not None:
+        app.state.ai_service = ai_service
+    if tts_service is not None:
+        app.state.tts_service = tts_service
 
     @app.on_event("startup")
     def startup() -> None:
@@ -79,6 +111,8 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
             init_db(app.state.db)
         if not hasattr(app.state, "ai_service") or app.state.ai_service is None:
             app.state.ai_service = ai_service or AIService(default_client=StubAIClient())
+        if not hasattr(app.state, "tts_service") or app.state.tts_service is None:
+            app.state.tts_service = tts_service or TextToSpeechService()
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
@@ -294,6 +328,71 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
         result = service.list_memory(user_id=x_user_id, chat_id=chat_id)
         return [MemoryResponse(**item) for item in result]
 
+    # ── internal: audio ─────────────────────────────────────
+
+    @app.post(JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH.path)
+    async def synthesize_speech(
+        body: TextToSpeechRequest,
+        x_user_id: str = Header(...),
+        x_request_id: str = Header(default=""),
+    ) -> Response:
+        _ = x_user_id, x_request_id
+        service = _get_tts_service(app)
+        try:
+            result = await service.synthesize(body)
+        except TextToSpeechError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        return Response(
+            content=result.audio,
+            media_type=result.media_type,
+            headers={
+                "X-TTS-Provider": result.provider,
+                "X-TTS-Model": result.model,
+                "X-TTS-Voice": result.voice,
+                "X-TTS-Format": result.response_format,
+                "X-AI-Generated-Voice": "true",
+            },
+        )
+
+    @app.post(JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path)
+    async def synthesize_speech_pcm(
+        body: TextToSpeechPCMRequest,
+        x_user_id: str = Header(...),
+        x_request_id: str = Header(default=""),
+    ) -> StreamingResponse:
+        _ = x_user_id, x_request_id
+        service = _get_tts_service(app)
+        try:
+            if hasattr(service, "ensure_server_pcm_available"):
+                service.ensure_server_pcm_available()
+            headers = service.server_pcm_headers(body)
+            stream = service.stream_server_pcm(body)
+            first_chunk = await anext(stream)
+        except StopAsyncIteration as exc:
+            raise HTTPException(status_code=503, detail="tts produced no pcm audio") from exc
+        except TextToSpeechError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+        async def stream_with_first_chunk():
+            yield first_chunk
+            async for chunk in stream:
+                yield chunk
+
+        return StreamingResponse(
+            stream_with_first_chunk(),
+            media_type="audio/pcm",
+            headers=headers,
+        )
+
+    @app.get(JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_MODELS.path)
+    def list_speech_models(
+        x_user_id: str = Header(...),
+        x_request_id: str = Header(default=""),
+    ) -> dict[str, object]:
+        _ = x_user_id, x_request_id
+        service = _get_tts_service(app)
+        return {"models": service.list_models()}
+
     # ── internal: client runtime profile ──────────────────────
 
     @app.put(
@@ -320,6 +419,84 @@ def create_app(db: DBClient | None = None, ai_service: AIService | None = None) 
     ) -> RuntimeProfileResponse:
         result = get_runtime_profile(app.state.db, user_id=x_user_id)
         return RuntimeProfileResponse(**result)
+
+    # ── internal: todos ─────────────────────────────────────
+
+    @app.post(
+        JarvisCoreEndpoints.INTERNAL_TODOS.path,
+        response_model=TodoResponse,
+    )
+    def create_todo(
+        body: TodoCreateRequest,
+        x_user_id: str = Header(...),
+        x_user_email: str = Header(default=""),
+    ) -> TodoResponse:
+        ensure_user_exists(
+            app.state.db,
+            user_id=x_user_id,
+            email=x_user_email or f"{x_user_id}@local.jarvis",
+        )
+        result = create_todo_item(
+            app.state.db,
+            user_id=x_user_id,
+            payload=body.model_dump(mode="json"),
+        )
+        return TodoResponse(**result)
+
+    @app.get(
+        JarvisCoreEndpoints.INTERNAL_TODOS_LIST.path,
+        response_model=TodoListResponse,
+    )
+    def list_todos(
+        x_user_id: str = Header(...),
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> TodoListResponse:
+        items = list_todo_items(
+            app.state.db,
+            user_id=x_user_id,
+            status=status,
+            include_deleted=include_deleted,
+            limit=limit,
+        )
+        return TodoListResponse(items=[TodoResponse(**item) for item in items])
+
+    @app.get(
+        JarvisCoreEndpoints.INTERNAL_TODO_DETAIL.path,
+        response_model=TodoResponse,
+    )
+    def read_todo(todo_id: str, x_user_id: str = Header(...)) -> TodoResponse:
+        result = get_todo_item(app.state.db, user_id=x_user_id, todo_id=todo_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="todo not found")
+        return TodoResponse(**result)
+
+    @app.patch(
+        JarvisCoreEndpoints.INTERNAL_TODO_UPDATE.path,
+        response_model=TodoResponse,
+    )
+    def patch_todo(
+        todo_id: str,
+        body: TodoUpdateRequest,
+        x_user_id: str = Header(...),
+    ) -> TodoResponse:
+        result = update_todo_item(
+            app.state.db,
+            user_id=x_user_id,
+            todo_id=todo_id,
+            updates=body.model_dump(exclude_unset=True, mode="json"),
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="todo not found")
+        return TodoResponse(**result)
+
+    @app.delete(JarvisCoreEndpoints.INTERNAL_TODO_DELETE.path)
+    def remove_todo(todo_id: str, x_user_id: str = Header(...)) -> dict[str, object]:
+        deleted = delete_todo_item(app.state.db, user_id=x_user_id, todo_id=todo_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="todo not found")
+        return {"id": todo_id, "deleted": True}
 
     # ── internal: deepthink ────────────────────────────────
 

@@ -7,6 +7,16 @@ DEEP_KEYWORDS = {
     "tradeoff",
     "debug",
     "root cause",
+    "계획",
+    "분석",
+    "설계",
+    "아키텍처",
+    "구조",
+    "비교",
+    "우선순위",
+    "트레이드오프",
+    "원인",
+    "디버그",
 }
 
 
@@ -18,4 +28,4 @@ def choose_route(message: str, task_type: str = "general") -> str:
         return "deep"
     if any(keyword in lowered for keyword in DEEP_KEYWORDS):
         return "deep"
-    return "fast"
+    return "realtime"

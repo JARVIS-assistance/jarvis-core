@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
-from ai import AIService
 from jarvis_contracts import normalize_action_payload
+
+from ai import AIService
+from core.config.prompt_loader import load_prompt as _load_prompt
 from core.db.db_connection import DBClient
 from core.db.db_operations import (
     add_message,
@@ -21,8 +24,6 @@ from core.db.db_operations import (
     list_memory_items,
     list_recent_messages,
 )
-
-from core.config.prompt_loader import load_prompt as _load_prompt
 
 from .action_executor import ActionExecutor, ExecutionResult
 from .schemas import (
@@ -380,17 +381,7 @@ class DeepThinkService:
         self.action_executor = ActionExecutor()
 
     def _select_deep_model(self, user_id: str) -> dict[str, Any]:
-        """Use the active default model first, then fall back to deep selection."""
-        config = get_active_model_for_user(self.db, user_id=user_id)
-        if config is not None and bool(config.get("is_default", False)):
-            logger.info(
-                "[deepthink] model selected via default "
-                "provider=%s/%s model=%s config_id=%s user=%s",
-                config["provider_mode"], config["provider_name"],
-                config["model_name"], config["id"], user_id,
-            )
-            return config
-
+        """Use the user's deep selection first, then fall back to default."""
         selection = get_user_ai_selection(self.db, user_id=user_id)
         if selection is not None:
             deep_id = selection.get("deep_model_config_id")
@@ -407,6 +398,16 @@ class DeepThinkService:
                     )
                     return model
 
+        config = get_active_model_for_user(self.db, user_id=user_id)
+        if config is not None and bool(config.get("is_default", False)):
+            logger.info(
+                "[deepthink] model selected via default "
+                "provider=%s/%s model=%s config_id=%s user=%s",
+                config["provider_mode"], config["provider_name"],
+                config["model_name"], config["id"], user_id,
+            )
+            return config
+
         if config is not None:
             logger.info(
                 "[deepthink] model selected via active model "
@@ -417,16 +418,26 @@ class DeepThinkService:
             return config
 
         logger.warning(
-            "[deepthink] no model configured, using local-stub fallback user=%s",
+            "[deepthink] no model configured, using env fallback user=%s",
             user_id,
         )
         return {
             "id": "default-deep",
             "provider_mode": "local",
-            "provider_name": "local-default",
-            "model_name": "local-stub",
+            "provider_name": os.getenv("JARVIS_FALLBACK_PROVIDER_NAME", "ollama"),
+            "model_name": os.getenv("JARVIS_FALLBACK_MODEL_NAME", "qwen2.5:1.5b"),
             "api_key": None,
-            "endpoint": None,
+            "endpoint": os.getenv(
+                "JARVIS_FALLBACK_MODEL_ENDPOINT",
+                "http://host.docker.internal:3030/chat",
+            ),
+            "is_active": True,
+            "is_default": True,
+            "supports_stream": True,
+            "supports_realtime": False,
+            "transport": "http_sse",
+            "input_modalities": "text",
+            "output_modalities": "text",
         }
 
     def _build_ai_request(

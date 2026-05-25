@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import aiohttp
 
-from .schemas import AIRequest, AIResponse, AIStreamChunk
+from .schemas import AIRequest, AIResponse, AIStreamChunk, AITokenStreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,17 @@ def _optional_float_env(name: str) -> float | None:
         return None
 
 
+def _normalize_ollama_keep_alive(raw_keep_alive: str | None) -> str | None:
+    if raw_keep_alive is None:
+        return None
+    value = raw_keep_alive.strip()
+    if not value:
+        return None
+    if value.startswith("-"):
+        return None
+    return value
+
+
 class AIClient(Protocol):
     async def stream_chat(
         self, message: str, route: str, request_id: str
@@ -48,6 +59,10 @@ class AIClient(Protocol):
     async def respond_once(self, request: AIRequest) -> AIResponse: ...
 
     async def stream_tokens(self, request: AIRequest) -> AsyncGenerator[str, None]: ...
+
+    async def stream_token_events(
+        self, request: AIRequest
+    ) -> AsyncGenerator[AITokenStreamEvent, None]: ...
 
     async def realtime_session_start(self, request: AIRequest) -> str: ...
 
@@ -83,6 +98,13 @@ class StubAIClient:
         result = await self.respond_once(request)
         for token in result["content"].split():
             yield token + " "
+
+    async def stream_token_events(
+        self, request: AIRequest
+    ) -> AsyncGenerator[AITokenStreamEvent, None]:
+        async for token in self.stream_tokens(request):
+            yield {"type": "token", "content": token}
+        yield {"type": "done", "done_reason": "stop"}
 
     async def realtime_session_start(self, request: AIRequest) -> str:
         return str(uuid4())
@@ -405,7 +427,9 @@ class LocalLLMAIClient(StubAIClient):
             or os.getenv("JARVIS_OLLAMA_KEEP_ALIVE")
         )
         if keep_alive:
-            payload["keep_alive"] = keep_alive
+            normalized_keep_alive = _normalize_ollama_keep_alive(keep_alive)
+            if normalized_keep_alive:
+                payload["keep_alive"] = normalized_keep_alive
         think = os.getenv(
             f"JARVIS_OLLAMA_{route}_THINK",
             os.getenv("JARVIS_OLLAMA_THINK", "false" if route == "REALTIME" else ""),
@@ -431,10 +455,46 @@ class LocalLLMAIClient(StubAIClient):
             or _optional_float_env("JARVIS_OLLAMA_STREAM_READ_TIMEOUT")
             or (4.0 if route == "REALTIME" else None)
         )
+        min_sock_read = (
+            _optional_float_env(f"JARVIS_OLLAMA_{route}_STREAM_MIN_READ_TIMEOUT")
+            or _optional_float_env("JARVIS_OLLAMA_STREAM_MIN_READ_TIMEOUT")
+            or (25.0 if route == "REALTIME" else None)
+        )
+        if min_sock_read is not None:
+            sock_read = max(sock_read or min_sock_read, min_sock_read)
+        if sock_read is not None:
+            total = max(total, connect + sock_read + 5.0)
         return aiohttp.ClientTimeout(
             total=max(total, 1.0),
             connect=max(connect, 0.5),
             sock_read=max(sock_read, 0.5) if sock_read is not None else None,
+        )
+
+    @staticmethod
+    def _ollama_cold_timeout_for_request(request: AIRequest) -> aiohttp.ClientTimeout:
+        route = str(request.get("route") or "realtime").upper()
+        base = LocalLLMAIClient._ollama_timeout_for_request(request)
+        cold_sock_read = (
+            _optional_float_env(f"JARVIS_OLLAMA_{route}_STREAM_COLD_READ_TIMEOUT")
+            or _optional_float_env("JARVIS_OLLAMA_STREAM_COLD_READ_TIMEOUT")
+            or (45.0 if route == "REALTIME" else base.sock_read)
+        )
+        sock_read = max(
+            base.sock_read or 0.0,
+            cold_sock_read or 0.0,
+            0.5,
+        )
+        connect = max(base.connect or 0.5, 0.5)
+        cold_total = (
+            _optional_float_env(f"JARVIS_OLLAMA_{route}_STREAM_COLD_TOTAL_TIMEOUT")
+            or _optional_float_env("JARVIS_OLLAMA_STREAM_COLD_TOTAL_TIMEOUT")
+            or (connect + sock_read + 15.0)
+        )
+        total = max(base.total or 0.0, cold_total, connect + sock_read + 5.0)
+        return aiohttp.ClientTimeout(
+            total=total,
+            connect=connect,
+            sock_read=sock_read,
         )
 
     @staticmethod
@@ -546,10 +606,20 @@ class LocalLLMAIClient(StubAIClient):
 
     async def stream_tokens(self, request: AIRequest) -> AsyncGenerator[str, None]:
         """aiohttp로 OpenAI-compatible SSE 엔드포인트에서 토큰을 실시간 스트리밍."""
+        async for event in self.stream_token_events(request):
+            if event.get("type") == "token":
+                content = event.get("content")
+                if content:
+                    yield content
+
+    async def stream_token_events(
+        self, request: AIRequest
+    ) -> AsyncGenerator[AITokenStreamEvent, None]:
+        """Stream token events, preserving provider completion metadata."""
         provider = request["provider_name"].lower()
         if self._is_ollama_provider(provider):
-            async for token in self._stream_ollama_tokens(request):
-                yield token
+            async for event in self._stream_ollama_events(request):
+                yield event
             return
 
         raw_endpoint = (request.get("endpoint") or "http://localhost:8080").rstrip("/")
@@ -574,7 +644,8 @@ class LocalLLMAIClient(StubAIClient):
                 if resp.status != 200:
                     body = await resp.text()
                     logger.error("[AI-SSE-ERROR] status=%s body=%s", resp.status, body[:300])
-                    yield f"[provider-error] HTTP {resp.status}"
+                    yield {"type": "token", "content": f"[provider-error] HTTP {resp.status}"}
+                    yield {"type": "done", "done_reason": "error"}
                     return
 
                 count = 0
@@ -591,13 +662,15 @@ class LocalLLMAIClient(StubAIClient):
                         content = delta.get("content")
                         if content:
                             count += 1
-                            yield content
+                            yield {"type": "token", "content": content}
                     except (json.JSONDecodeError, IndexError, KeyError):
                         continue
                 logger.info("[AI-SSE-RESPONSE] streamed %d tokens", count)
+                yield {"type": "done", "done_reason": "stop"}
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("[AI-SSE-ERROR] %s", exc)
-            yield f"[provider-error] {exc}"
+            yield {"type": "token", "content": f"[provider-error] {exc}"}
+            yield {"type": "done", "done_reason": "error"}
 
     # ── respond_once / realtime (unchanged pattern) ─────────────────
 
@@ -605,6 +678,57 @@ class LocalLLMAIClient(StubAIClient):
         self,
         request: AIRequest,
     ) -> AsyncGenerator[str, None]:
+        async for event in self._stream_ollama_events(request):
+            if event.get("type") == "token":
+                content = event.get("content")
+                if content:
+                    yield content
+
+    async def _stream_ollama_events(
+        self,
+        request: AIRequest,
+    ) -> AsyncGenerator[AITokenStreamEvent, None]:
+        timeout = self._ollama_timeout_for_request(request)
+        yielded_any = False
+        try:
+            async for event in self._stream_ollama_events_once(request, timeout=timeout):
+                if event.get("type") == "token":
+                    yielded_any = True
+                yield event
+            return
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if yielded_any:
+                logger.error("[AI-OLLAMA-STREAM-ERROR] %s", exc)
+                yield {"type": "token", "content": f"[provider-error] {exc}"}
+                yield {"type": "done", "done_reason": "error"}
+                return
+
+            cold_timeout = self._ollama_cold_timeout_for_request(request)
+            logger.warning(
+                "[AI-OLLAMA-STREAM-RETRY] no tokens before timeout; "
+                "retrying with cold-start timeout total=%s read=%s error=%s",
+                cold_timeout.total,
+                cold_timeout.sock_read,
+                exc,
+            )
+            try:
+                async for event in self._stream_ollama_events_once(
+                    request,
+                    timeout=cold_timeout,
+                ):
+                    yield event
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError) as retry_exc:
+                logger.error("[AI-OLLAMA-STREAM-ERROR] %s", retry_exc)
+                yield {"type": "token", "content": f"[provider-error] {retry_exc}"}
+                yield {"type": "done", "done_reason": "error"}
+
+    async def _stream_ollama_events_once(
+        self,
+        request: AIRequest,
+        *,
+        timeout: aiohttp.ClientTimeout,
+    ) -> AsyncGenerator[AITokenStreamEvent, None]:
         endpoint, endpoint_type = self._resolve_ollama_endpoint(
             request.get("endpoint"),
             request["provider_name"],
@@ -632,56 +756,57 @@ class LocalLLMAIClient(StubAIClient):
         if fallback is not None:
             endpoints.append(fallback)
 
-        timeout = self._ollama_timeout_for_request(request)
-        try:
-            session = await self._session_for_timeout(timeout)
-            for candidate_endpoint in endpoints:
-                logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", candidate_endpoint)
-                async with session.post(
-                    candidate_endpoint, json=payload, headers=headers
-                ) as resp:
-                    if resp.status == 404 and candidate_endpoint != endpoints[-1]:
-                        body = await resp.text()
-                        logger.info(
-                            "[AI-OLLAMA-STREAM-FALLBACK] status=404 endpoint=%s body=%s",
-                            candidate_endpoint,
-                            body[:300],
-                        )
-                        continue
+        session = await self._session_for_timeout(timeout)
+        for candidate_endpoint in endpoints:
+            logger.info("[AI-OLLAMA-STREAM-REQUEST] POST %s", candidate_endpoint)
+            async with session.post(
+                candidate_endpoint, json=payload, headers=headers
+            ) as resp:
+                if resp.status == 404 and candidate_endpoint != endpoints[-1]:
+                    body = await resp.text()
+                    logger.info(
+                        "[AI-OLLAMA-STREAM-FALLBACK] status=404 endpoint=%s body=%s",
+                        candidate_endpoint,
+                        body[:300],
+                    )
+                    continue
 
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error(
-                            "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
-                            resp.status,
-                            body[:300],
-                        )
-                        yield f"[provider-error] HTTP {resp.status}"
-                        return
-
-                    count = 0
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if endpoint_type == "chat":
-                            token = chunk.get("message", {}).get("content")
-                        else:
-                            token = chunk.get("response")
-                        if isinstance(token, str) and token:
-                            count += 1
-                            yield token
-                        if chunk.get("done") is True:
-                            break
-                    logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(
+                        "[AI-OLLAMA-STREAM-ERROR] status=%s body=%s",
+                        resp.status,
+                        body[:300],
+                    )
+                    yield {"type": "token", "content": f"[provider-error] HTTP {resp.status}"}
+                    yield {"type": "done", "done_reason": "error"}
                     return
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("[AI-OLLAMA-STREAM-ERROR] %s", exc)
-            yield f"[provider-error] {exc}"
+
+                count = 0
+                done_reason = "stop"
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if endpoint_type == "chat":
+                        token = chunk.get("message", {}).get("content")
+                    else:
+                        token = chunk.get("response")
+                    if isinstance(token, str) and token:
+                        count += 1
+                        yield {"type": "token", "content": token}
+                    if chunk.get("done") is True:
+                        raw_done_reason = chunk.get("done_reason") or chunk.get("finish_reason")
+                        if isinstance(raw_done_reason, str) and raw_done_reason:
+                            done_reason = raw_done_reason
+                        break
+                logger.info("[AI-OLLAMA-STREAM-RESPONSE] streamed %d tokens", count)
+                yield {"type": "done", "done_reason": done_reason}
+                return
 
     async def respond_once(self, request: AIRequest) -> AIResponse:
         provider = request["provider_name"].lower()

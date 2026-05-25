@@ -20,14 +20,26 @@ from .persona_memory import (
     select_user_persona,
     update_user_persona,
 )
-from .sessions import create_session, ensure_user_exists, get_or_create_session_for_user, get_session
+from .sessions import (
+    create_session,
+    ensure_user_exists,
+    get_or_create_session_for_user,
+    get_session,
+)
+from .todo import (
+    create_todo_item,
+    delete_todo_item,
+    get_todo_item,
+    list_todo_items,
+    update_todo_item,
+)
+from .user import create_user, find_user_by_email, find_user_by_id
 from .user_settings import (
     ensure_user_settings,
     get_runtime_profile,
     get_user_settings,
     set_runtime_profile,
 )
-from .user import create_user, find_user_by_email, find_user_by_id
 
 __all__ = [
     "add_message",
@@ -37,6 +49,7 @@ __all__ = [
     "create_user",
     "create_user_model_config",
     "delete_user_model_config",
+    "create_todo_item",
     "create_user_persona",
     "ensure_default_persona_for_user",
     "ensure_user_exists",
@@ -48,11 +61,13 @@ __all__ = [
     "get_or_create_session_for_user",
     "get_selected_persona_for_user",
     "get_session",
+    "get_todo_item",
     "get_runtime_profile",
     "get_user_ai_selection",
     "get_user_settings",
     "list_recent_messages",
     "list_memory_items",
+    "list_todo_items",
     "list_user_model_configs",
     "list_user_personas",
     "now_iso",
@@ -61,5 +76,7 @@ __all__ = [
     "set_user_ai_selection",
     "set_runtime_profile",
     "update_user_persona",
+    "update_todo_item",
     "update_user_model_config",
+    "delete_todo_item",
 ]

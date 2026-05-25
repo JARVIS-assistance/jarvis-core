@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .db_connection import DBClient
 
-
 POSTGRES_STATEMENTS = [
     # Enums
     """
@@ -135,6 +134,32 @@ POSTGRES_STATEMENTS = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS todo_items (
+      id uuid PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title varchar(200) NOT NULL,
+      description text,
+      status varchar(20) NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'completed', 'cancelled', 'archived')),
+      priority smallint NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
+      due_at timestamptz,
+      remind_at timestamptz,
+      timezone varchar(64),
+      calendar_provider varchar(80),
+      calendar_id varchar(200),
+      calendar_event_id varchar(200),
+      calendar_sync_status varchar(20) NOT NULL DEFAULT 'none'
+        CHECK (calendar_sync_status IN ('none', 'linked', 'pending', 'synced', 'failed')),
+      chat_id uuid REFERENCES chats(id) ON DELETE SET NULL,
+      source_message_id uuid REFERENCES messages(id) ON DELETE SET NULL,
+      metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      completed_at timestamptz,
+      deleted_at timestamptz
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS ai_model_configs (
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -172,6 +197,9 @@ POSTGRES_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_memory_items_user_importance_created ON memory_items(user_id, importance, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_memory_items_chat_created ON memory_items(chat_id, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_memory_links_message_id ON memory_links(message_id);",
+    "CREATE INDEX IF NOT EXISTS idx_todo_items_user_status_due ON todo_items(user_id, status, due_at);",
+    "CREATE INDEX IF NOT EXISTS idx_todo_items_user_updated ON todo_items(user_id, updated_at);",
+    "CREATE INDEX IF NOT EXISTS idx_todo_items_calendar_ref ON todo_items(calendar_provider, calendar_id, calendar_event_id);",
     "CREATE INDEX IF NOT EXISTS idx_ai_model_configs_user_default_updated ON ai_model_configs(user_id, is_default, updated_at);",
     "CREATE INDEX IF NOT EXISTS idx_user_ai_model_selection_realtime ON user_ai_model_selection(realtime_model_config_id);",
     "CREATE INDEX IF NOT EXISTS idx_user_ai_model_selection_deep ON user_ai_model_selection(deep_model_config_id);",
@@ -274,6 +302,32 @@ CREATE TABLE IF NOT EXISTS memory_links (
     FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS todo_items (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'completed', 'cancelled', 'archived')),
+    priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
+    due_at TEXT,
+    remind_at TEXT,
+    timezone TEXT,
+    calendar_provider TEXT,
+    calendar_id TEXT,
+    calendar_event_id TEXT,
+    calendar_sync_status TEXT NOT NULL DEFAULT 'none' CHECK (calendar_sync_status IN ('none', 'linked', 'pending', 'synced', 'failed')),
+    chat_id TEXT,
+    source_message_id TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    deleted_at TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE SET NULL,
+    FOREIGN KEY(source_message_id) REFERENCES messages(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS ai_model_configs (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -313,6 +367,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_summaries_chat_created_at ON chat_summaries(
 CREATE INDEX IF NOT EXISTS idx_memory_items_user_importance_created ON memory_items(user_id, importance, created_at);
 CREATE INDEX IF NOT EXISTS idx_memory_items_chat_created ON memory_items(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_memory_links_message_id ON memory_links(message_id);
+CREATE INDEX IF NOT EXISTS idx_todo_items_user_status_due ON todo_items(user_id, status, due_at);
+CREATE INDEX IF NOT EXISTS idx_todo_items_user_updated ON todo_items(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_todo_items_calendar_ref ON todo_items(calendar_provider, calendar_id, calendar_event_id);
 CREATE INDEX IF NOT EXISTS idx_ai_model_configs_user_default_updated ON ai_model_configs(user_id, is_default, updated_at);
 CREATE INDEX IF NOT EXISTS idx_user_ai_model_selection_realtime ON user_ai_model_selection(realtime_model_config_id);
 CREATE INDEX IF NOT EXISTS idx_user_ai_model_selection_deep ON user_ai_model_selection(deep_model_config_id);
