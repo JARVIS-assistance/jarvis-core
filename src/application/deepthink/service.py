@@ -113,15 +113,18 @@ Include actions in a JSON array fenced with ```actions ... ```.
 | type | command | target | payload | args |
 |------|---------|--------|---------|------|
 | screenshot | null | null | null | {region: [x,y,w,h] or null} |
+| screen_stream | start / stop / describe | null | null | start:{fps?,quality?,max_width?}; describe:{prompt?} |
 | mouse_click | null | null | null | {x, y, button: "left", clicks: 1} |
-| mouse_drag | null | null | null | {start_x, start_y, end_x, end_y} |
+| mouse_drag | null | null | null | {start_x, start_y, end_x, end_y, button?} |
+| mouse_move | null / position | null | null | {x, y, duration_seconds?} |
+| mouse_scroll | null | null | null | {amount, direction, x?, y?} |
 | keyboard_type | null | null | text to type | {enter: true} |
-| hotkey | key combo e.g. "ctrl,c" | null | null | {} |
+| hotkey | key combo e.g. "ctrl,c" | null | null | {duration_seconds? — hold the key, e.g. for movement} |
 
 ## Rules
 1. **Logical tasks** (terminal, file, app, search): execute directly, no screenshot needed.
 2. **Web page tasks**: if clicking or typing inside the current page is needed, emit `browser_control` command `extract_dom` first. Use `click_element` or `type_element` only after DOM results provide an `ai_id`.
-3. **Physical tasks** (GUI click, type in app): if coordinates are unknown and DOM control is not applicable, emit a `screenshot` action first. The next step will receive the screenshot result for coordinate analysis.
+3. **Physical tasks** (GUI click, type in app): a plain `screenshot` action returns a raw image you (a text-only model) cannot see — its result is not usable for coordinate analysis. To actually understand what is on screen, emit `screen_stream` command `start` once (if not already streaming), then `screen_stream` command `describe` — that result is a text description you CAN read and reason about. For a task that requires reacting to a changing screen over multiple turns (games, multi-step UI flows you can't fully plan up front), you may be invoked again for the same step after your actions run: emit only the `describe` + the next single action for now, don't try to solve the whole task in one response. When the goal is fully achieved, emit a `notify` action summarizing the result instead of further actions — that signals you are done.
 4. **Search tasks**: emit `web_search` only when the current step explicitly requires web search or live facts. For recommendation, advice, brainstorming, menu suggestions, and casual follow-ups, answer directly without actions unless the user explicitly asks to search/browse/open a page. The server will execute the search and inject results into the next step's context automatically.
 5. `requires_confirm`: true for destructive operations (delete, overwrite, install). false for reads, screenshots, notifications, searches.
 6. `description`: human-readable explanation in the user's language.
@@ -183,6 +186,11 @@ Type into a page field after DOM target is known:
 Notify user with search results:
 ```actions
 [{"type": "notify", "command": null, "target": null, "payload": "서울 현재 기온 18°C, 맑음, 미세먼지 보통", "args": {}, "description": "검색 결과를 사용자에게 알림", "requires_confirm": false}]
+```
+
+Understand the current screen before acting (vision-grounded loop):
+```actions
+[{"type": "screen_stream", "command": "describe", "target": null, "payload": null, "args": {}, "description": "현재 화면 상태 확인", "requires_confirm": false}]
 ```
 """
 
