@@ -23,6 +23,12 @@ from jarvis_contracts import (
 
 from ai import AIService
 from ai.client import StubAIClient
+from ai.vision import (
+    VisionDescribeError,
+    VisionDescribeRequest,
+    VisionDescribeResponse,
+    describe_image,
+)
 from application.audio.schemas import TextToSpeechPCMRequest, TextToSpeechRequest
 from application.audio.service import TextToSpeechError, TextToSpeechService
 from application.chat.schemas import (
@@ -392,6 +398,23 @@ def create_app(
         _ = x_user_id, x_request_id
         service = _get_tts_service(app)
         return {"models": service.list_models()}
+
+    # ── internal: vision ────────────────────────────────────
+
+    @app.post("/internal/vision/describe", response_model=VisionDescribeResponse)
+    async def describe_vision_image(
+        body: VisionDescribeRequest,
+        x_user_id: str = Header(...),
+    ) -> VisionDescribeResponse:
+        _ = x_user_id
+        try:
+            description, model = await describe_image(
+                body.image_base64,
+                prompt=body.prompt,
+            )
+        except VisionDescribeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return VisionDescribeResponse(description=description, model=model)
 
     # ── internal: client runtime profile ──────────────────────
 

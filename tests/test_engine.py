@@ -1,4 +1,4 @@
-from jarvis_core.engine import run_deep_thinking, run_realtime_conversation
+from core.config.engine import run_deep_thinking, run_realtime_conversation
 
 
 def test_realtime_conversation_returns_low_latency_shape() -> None:

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncGenerator
 from uuid import uuid4
@@ -246,6 +247,56 @@ def _use_compact_realtime_messages(route: str, provider_name: object) -> bool:
     return raw not in {"0", "false", "no"}
 
 
+def _realtime_context_reference_requested(message: str) -> bool:
+    folded = message.casefold()
+    compact = re.sub(r"\s+", "", folded)
+    context_terms = (
+        "이전",
+        "직전",
+        "방금",
+        "마지막",
+        "아까",
+        "앞에서",
+        "위에서",
+        "그거",
+        "그걸",
+        "그것",
+        "그 질문",
+        "그 답",
+        "그 내용",
+        "거기",
+        "이어서",
+        "계속",
+        "더 설명",
+        "자세히",
+        "다시 말",
+        "다시 알려",
+        "previous",
+        "last",
+        "earlier",
+        "above",
+        "that",
+        "it",
+        "continue",
+        "elaborate",
+        "more detail",
+    )
+    compact_patterns = (
+        "내가뭐라",
+        "내가뭐라고",
+        "뭐라고했",
+        "뭐라했",
+        "이어서",
+        "계속해",
+        "더알려",
+        "더설명",
+        "자세히설명",
+    )
+    return any(term in folded for term in context_terms) or any(
+        pattern in compact for pattern in compact_patterns
+    )
+
+
 def _is_default_persona(persona: dict[str, object]) -> bool:
     return (
         str(persona.get("alias") or "").strip().lower() == "default"
@@ -295,6 +346,14 @@ def _build_messages_for_model(
             if system_prompt and not context_messages
             else _get_realtime_system_prompt()
         )
+        if context_messages and _realtime_context_reference_requested(
+            effective_user_message
+        ):
+            return realtime_prompt, _build_alternating_messages(
+                system_prompt=realtime_prompt,
+                context_messages=context_messages,
+                user_message=effective_user_message,
+            )
         return realtime_prompt, [
             {"role": "system", "content": realtime_prompt},
             {
@@ -673,10 +732,14 @@ class ChatService:
         route = self._resolve_route(body.message, body.task_type, body.route_override)
         purpose = "deep" if route == "deep" else "realtime"
         selected = self._select_model_config(user_id=user_id, purpose=purpose)
-        compact_context = self._compact_prompt_context_for_model(
-            route=route,
-            selected_model=selected,
-            user_id=user_id,
+        compact_context = (
+            None
+            if _realtime_context_reference_requested(body.message)
+            else self._compact_prompt_context_for_model(
+                route=route,
+                selected_model=selected,
+                user_id=user_id,
+            )
         )
         if compact_context is None:
             system_prompt, prompt_messages = self._build_prompt_context(
@@ -948,10 +1011,14 @@ class ChatService:
                     content, task_type, event.get("route_override")
                 )
                 request_id = str(uuid4())
-                compact_context = self._compact_prompt_context_for_model(
-                    route=route,
-                    selected_model=selected,
-                    user_id=user_id,
+                compact_context = (
+                    None
+                    if _realtime_context_reference_requested(content)
+                    else self._compact_prompt_context_for_model(
+                        route=route,
+                        selected_model=selected,
+                        user_id=user_id,
+                    )
                 )
                 if compact_context is None:
                     system_prompt, prompt_messages = self._build_prompt_context(
@@ -1068,10 +1135,14 @@ class ChatService:
             )
             purpose = "deep" if route == "deep" else "realtime"
             selected = self._select_model_config(user_id=user_id, purpose=purpose)
-            compact_context = self._compact_prompt_context_for_model(
-                route=route,
-                selected_model=selected,
-                user_id=user_id,
+            compact_context = (
+                None
+                if _realtime_context_reference_requested(message)
+                else self._compact_prompt_context_for_model(
+                    route=route,
+                    selected_model=selected,
+                    user_id=user_id,
+                )
             )
             if compact_context is None:
                 system_prompt, prompt_messages = self._build_prompt_context(

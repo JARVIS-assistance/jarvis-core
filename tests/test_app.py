@@ -903,6 +903,24 @@ def test_ollama_realtime_uses_compact_current_turn_messages() -> None:
     ]
 
 
+def test_ollama_realtime_followup_keeps_recent_context() -> None:
+    _system_prompt, messages = _build_messages_for_model(
+        system_prompt="long workbench system prompt",
+        context_messages=[
+            {"role": "user", "content": "내 강아지 이름은 콩이야"},
+            {"role": "assistant", "content": "기억해둘게."},
+        ],
+        user_message="그거 다시 말해줘",
+        route="realtime",
+        selected_model={"provider_name": "ollama", "model_name": "gemma4:e2b"},
+    )
+
+    contents = "\n".join(str(message["content"]) for message in messages)
+    assert "내 강아지 이름은 콩이야" in contents
+    assert messages[-1]["content"].startswith("Latest user message.")
+    assert "그거 다시 말해줘" in messages[-1]["content"]
+
+
 def test_realtime_stream_uses_existing_user_persona_without_chat_selection(
     monkeypatch,
 ) -> None:
@@ -1403,6 +1421,50 @@ def test_realtime_stream_prefers_realtime_capable_model_without_selection() -> N
     assert response.status_code == 200
     assert "realtime-enabled-model" in body
     assert ai_client.requests[-1]["model_name"] == "realtime-enabled-model"
+
+
+def test_vision_describe_calls_local_model_and_returns_description(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_describe_image(image_base64, *, prompt=None, model=None, timeout_seconds=None):
+        calls.append({"image_base64": image_base64, "prompt": prompt})
+        return "A blue sky with a game HUD showing 100 HP.", "qwen2.5vl:3b"
+
+    monkeypatch.setattr("app.describe_image", fake_describe_image)
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        with TestClient(create_app(db=connect(db_file.name))) as client:
+            response = client.post(
+                "/internal/vision/describe",
+                json={"image_base64": "ZmFrZS1qcGVn"},
+                headers={"x-user-id": "u-vision"},
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["description"] == "A blue sky with a game HUD showing 100 HP."
+    assert body["model"] == "qwen2.5vl:3b"
+    assert calls[0]["image_base64"] == "ZmFrZS1qcGVn"
+
+
+def test_vision_describe_maps_model_error_to_502(monkeypatch) -> None:
+    from ai.vision import VisionDescribeError
+
+    async def failing_describe_image(image_base64, *, prompt=None, model=None, timeout_seconds=None):
+        raise VisionDescribeError("vision model network error: connection refused")
+
+    monkeypatch.setattr("app.describe_image", failing_describe_image)
+
+    with NamedTemporaryFile(suffix=".db") as db_file:
+        with TestClient(create_app(db=connect(db_file.name))) as client:
+            response = client.post(
+                "/internal/vision/describe",
+                json={"image_base64": "ZmFrZS1qcGVn"},
+                headers={"x-user-id": "u-vision"},
+            )
+
+    assert response.status_code == 502
+    assert "connection refused" in response.json()["detail"]
 
 
 def test_internal_persona_and_memory_endpoints() -> None:

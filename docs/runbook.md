@@ -4,7 +4,7 @@
 
 1. `python3.12 -m pip install -r requirements.txt
 python3.12 -m pip install -r requirements-dev.txt`
-2. `python3.12 -m uvicorn jarvis_core.app:app --reload --port 8000`
+2. `python3.12 -m uvicorn app:app --app-dir src --reload --port 8000`
 
 ## Health check
 
